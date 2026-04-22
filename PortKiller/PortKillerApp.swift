@@ -13,5 +13,14 @@ struct PortKillerApp: App {
         Settings {
             SettingsView(preferences: preferences)
         }
+
+        Window("About PortKiller", id: WindowID.about) {
+            AboutView()
+        }
+        .windowResizability(.contentSize)
     }
+}
+
+enum WindowID {
+    static let about = "about"
 }

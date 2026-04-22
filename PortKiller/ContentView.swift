@@ -5,6 +5,7 @@ struct MenuBarContentView: View {
     @State private var monitor: PortMonitor
     @State private var expandedPort: Int?
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.openWindow) private var openWindow
 
     init(preferences: UserPreferences) {
         self.preferences = preferences
@@ -65,7 +66,17 @@ struct MenuBarContentView: View {
                         }
                     },
                     onKill: {
-                        Task { await monitor.kill(port) }
+                        Task {
+                            let result = await monitor.kill(port)
+                            if case .failed(let reason) = result {
+                                await NotificationService.showKillFailure(
+                                    port: port.port,
+                                    processName: port.processName,
+                                    pid: port.pid,
+                                    reason: reason
+                                )
+                            }
+                        }
                     }
                 )
                 if port.id != monitor.visiblePorts.last?.id {
@@ -94,7 +105,16 @@ struct MenuBarContentView: View {
     }
 
     private var footer: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 14) {
+            Button {
+                openWindow(id: WindowID.about)
+                NSApp.activate(ignoringOtherApps: true)
+            } label: {
+                Label("About", systemImage: "info.circle")
+                    .labelStyle(.titleAndIcon)
+            }
+            .buttonStyle(.plain)
+
             Button {
                 openSettings()
                 // 메뉴바 앱은 LSUIElement=YES 라서 자동으로 앞에 안 옴.
