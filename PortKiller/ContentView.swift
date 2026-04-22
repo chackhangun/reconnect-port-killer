@@ -1,26 +1,14 @@
 import SwiftUI
 
 struct MenuBarContentView: View {
-    @State private var monitor = PortMonitor(ports: [
-        Port(number: 3000, label: "Next.js / dev"),
-        Port(number: 5173, label: "Vite"),
-        Port(number: 8080, label: "Generic HTTP"),
-    ])
-
-    private var occupiedPorts: [Port] {
-        monitor.ports.filter { port in
-            switch monitor.statuses[port.number] ?? .unknown {
-            case .occupied, .killing: true
-            default: false
-            }
-        }
-    }
+    @State private var monitor = PortMonitor()
+    @State private var expandedPort: Int?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            if occupiedPorts.isEmpty {
+            if monitor.visiblePorts.isEmpty {
                 emptyState
             } else {
                 portList
@@ -28,26 +16,9 @@ struct MenuBarContentView: View {
             Divider()
             footer
         }
-        .frame(width: 320)
+        .frame(width: 380)
         .onAppear { monitor.start() }
         .onDisappear { monitor.stop() }
-    }
-
-    private var emptyState: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                Text("점유 중인 포트 없음")
-                    .foregroundStyle(.secondary)
-            }
-            Text("감시: \(monitor.ports.map { String($0.number) }.joined(separator: ", "))")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 16)
     }
 
     private var header: some View {
@@ -73,25 +44,49 @@ struct MenuBarContentView: View {
 
     private var portList: some View {
         VStack(spacing: 0) {
-            ForEach(occupiedPorts) { port in
+            ForEach(monitor.visiblePorts) { port in
                 PortRowView(
                     port: port,
-                    status: monitor.statuses[port.number] ?? .unknown,
+                    isKilling: monitor.isKilling(port),
+                    isExpanded: expandedPort == port.port,
+                    onToggleExpand: {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            expandedPort = (expandedPort == port.port) ? nil : port.port
+                        }
+                    },
                     onKill: {
                         Task { await monitor.kill(port) }
                     }
                 )
-                if port.id != occupiedPorts.last?.id {
+                if port.id != monitor.visiblePorts.last?.id {
                     Divider().padding(.leading, 12)
                 }
             }
         }
     }
 
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                Text("점유 중인 dev 서버 없음")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+            }
+            Text("시스템 전체 LISTEN 포트를 5초마다 자동 감지")
+                .font(.footnote)
+                .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 16)
+    }
+
     private var footer: some View {
         HStack(spacing: 16) {
             Button {
-                // Phase 4: Settings 창
+                // Phase 4b: Settings 창
             } label: {
                 Label("Settings…", systemImage: "gear")
                     .labelStyle(.titleAndIcon)
@@ -116,91 +111,111 @@ struct MenuBarContentView: View {
 }
 
 private struct PortRowView: View {
-    let port: Port
-    let status: PortStatus
+    let port: ListeningProcess
+    let isKilling: Bool
+    let isExpanded: Bool
+    let onToggleExpand: () -> Void
     let onKill: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 8, height: 8)
-
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text("\(port.number)")
-                        .font(.system(.body, design: .monospaced))
-                        .fontWeight(.semibold)
-                    Text(port.label)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                statusDescription
-            }
-
-            Spacer()
-
-            switch status {
-            case .occupied:
-                Button("Kill", role: .destructive, action: onKill)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-            case .killing:
-                ProgressView()
-                    .controlSize(.small)
-            default:
-                EmptyView()
+        VStack(alignment: .leading, spacing: 0) {
+            mainRow
+            if isExpanded {
+                expandedDetails
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
         .opacity(isKilling ? 0.6 : 1.0)
     }
 
-    private var isKilling: Bool {
-        if case .killing = status { return true }
-        return false
-    }
+    private var mainRow: some View {
+        Button(action: onToggleExpand) {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(isKilling ? Color.yellow : Color.red)
+                    .frame(width: 8, height: 8)
 
-    private var statusColor: Color {
-        switch status {
-        case .free: .green
-        case .occupied: .red
-        case .killing: .yellow
-        case .checking: .yellow
-        case .unknown: .gray
-        case .error: .orange
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text("\(port.port)")
+                            .font(.system(.title3, design: .monospaced))
+                            .fontWeight(.semibold)
+                        Text(port.displayName)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    if isKilling {
+                        Text("PID \(port.pid) · \(port.processName) — 종료 중…")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("PID \(port.pid) · \(port.processName)")
+                            .font(.footnote)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.down")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(isExpanded ? 0 : -90))
+
+                if isKilling {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Button("Kill", role: .destructive, action: onKill)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
     }
 
     @ViewBuilder
-    private var statusDescription: some View {
-        switch status {
-        case .free:
-            Text("사용 가능")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        case .occupied(let occupant):
-            Text("\(occupant.processName) (PID \(occupant.pid))")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        case .killing(let occupant):
-            Text("\(occupant.processName) (PID \(occupant.pid)) — 종료 중…")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        case .checking:
-            Text("확인 중…")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        case .unknown:
-            Text("대기")
-                .font(.caption)
+    private var expandedDetails: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let etime = port.elapsedTime {
+                detailRow(label: "실행 시간", value: etime)
+            }
+            if let cwd = port.workingDirectory {
+                detailRow(label: "작업 디렉토리", value: cwd, monospaced: true)
+            }
+            if let command = port.command {
+                detailRow(label: "명령어", value: command, monospaced: true)
+            }
+            if port.elapsedTime == nil && port.workingDirectory == nil && port.command == nil {
+                Text("상세 정보를 불러오지 못함")
+                    .font(.footnote)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.leading, 30)
+        .padding(.trailing, 12)
+        .padding(.bottom, 12)
+        .padding(.top, 2)
+    }
+
+    private func detailRow(label: String, value: String, monospaced: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.footnote)
+                .fontWeight(.medium)
                 .foregroundStyle(.tertiary)
-        case .error(let message):
-            Text(message)
-                .font(.caption)
-                .foregroundStyle(.red)
-                .lineLimit(2)
+            Text(value)
+                .font(monospaced ? .system(.callout, design: .monospaced) : .callout)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .lineLimit(3)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }

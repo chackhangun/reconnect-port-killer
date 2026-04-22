@@ -3,18 +3,40 @@ import Observation
 
 @Observable
 final class PortMonitor {
-    private(set) var ports: [Port]
-    var statuses: [Int: PortStatus] = [:]
+    /// 마지막 스캔으로 발견된 포트들 (포트번호 → 정보)
+    private var discovered: [Int: ListeningProcess] = [:]
+    /// kill 진행 중인 포트 스냅샷 (포트번호 → 직전 정보).
+    /// kill이 확정되기 전까지 행이 사라지지 않게 유지.
+    private var killing: [Int: ListeningProcess] = [:]
+
+    var visiblePorts: [ListeningProcess] {
+        var byPort = discovered
+        for (port, snapshot) in killing where byPort[port] == nil {
+            byPort[port] = snapshot
+        }
+        return byPort.values.sorted { $0.port < $1.port }
+    }
+
+    func isKilling(_ port: ListeningProcess) -> Bool {
+        killing[port.port] != nil
+    }
 
     private var pollingTask: Task<Void, Never>?
     private let pollingInterval: TimeInterval
 
-    init(ports: [Port], pollingInterval: TimeInterval = 5.0) {
-        self.ports = ports
+    /// 추가 process 이름 패턴. 기본 화이트리스트에 더해서 매칭.
+    var extraProcessPatterns: [String]
+    /// 추가 포트 번호. 화이트리스트와 무관하게 항상 노출.
+    var extraPortNumbers: Set<Int>
+
+    init(
+        pollingInterval: TimeInterval = 5.0,
+        extraProcessPatterns: [String] = [],
+        extraPortNumbers: [Int] = []
+    ) {
         self.pollingInterval = pollingInterval
-        for port in ports {
-            statuses[port.number] = .unknown
-        }
+        self.extraProcessPatterns = extraProcessPatterns
+        self.extraPortNumbers = Set(extraPortNumbers)
     }
 
     func start() {
@@ -22,7 +44,7 @@ final class PortMonitor {
         pollingTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                self.refresh()
+                await self.performScan()
                 try? await Task.sleep(for: .seconds(self.pollingInterval))
             }
         }
@@ -34,84 +56,380 @@ final class PortMonitor {
     }
 
     func refresh() {
-        for port in ports {
-            check(port, showChecking: false)
-        }
+        Task { await performScan() }
     }
 
     @discardableResult
-    func kill(_ port: Port) async -> ProcessKiller.Result? {
-        guard case .occupied(let occupant) = statuses[port.number] else {
-            return nil
-        }
-        // 종료가 확정되기 전까지는 원래 점유자 정보를 유지한 채 .killing 표시.
-        // 이렇게 해야 행이 즉시 사라지지 않고, 사용자가 진행 상황을 볼 수 있음.
-        statuses[port.number] = .killing(occupant)
-        let result = await ProcessKiller.kill(pid: occupant.pid)
-        check(port, showChecking: false)
+    func kill(_ port: ListeningProcess) async -> ProcessKiller.Result? {
+        killing[port.port] = port
+        let result = await ProcessKiller.kill(pid: port.pid)
+        await performScan()
+        killing.removeValue(forKey: port.port)
         return result
     }
 
-    // showChecking: 사용자 액션이 진행 중임을 보여줄 때만 true.
-    // 백그라운드 폴링은 false로 호출해서 깜빡임 방지.
-    private func check(_ port: Port, showChecking: Bool) {
-        if showChecking {
-            statuses[port.number] = .checking
+    private func performScan() async {
+        let extras = extraProcessPatterns
+        let extraPorts = extraPortNumbers
+        let scanned = await Task.detached(priority: .userInitiated) {
+            let basics = Self.scanListeningBasics()
+            let visible = basics.filter {
+                Self.isVisible($0, extraPatterns: extras, extraPorts: extraPorts)
+            }
+            return Self.enrich(visible)
+        }.value
+
+        var newDiscovered: [Int: ListeningProcess] = [:]
+        for proc in scanned {
+            newDiscovered[proc.port] = proc
         }
-        let portNumber = port.number
-        Task.detached(priority: .userInitiated) {
-            let newStatus = Self.queryStatus(portNumber: portNumber)
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                // 실제로 바뀐 경우에만 대입 → SwiftUI 불필요한 리렌더링 방지
-                if self.statuses[portNumber] != newStatus {
-                    self.statuses[portNumber] = newStatus
+        if newDiscovered != discovered {
+            discovered = newDiscovered
+        }
+    }
+
+    // MARK: - lsof scan (1차: 기본 정보)
+
+    /// 1차 스캔에서만 쓰이는 중간 타입.
+    /// lsof만으로는 command 전체 / cwd / etime을 못 얻기 때문에 분리.
+    private struct BasicListening {
+        let port: Int
+        let pid: Int32
+        let processName: String
+    }
+
+    private nonisolated static func scanListeningBasics() -> [BasicListening] {
+        guard let output = try? ShellRunner.run(
+            "/usr/sbin/lsof",
+            ["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pcn"]
+        ) else {
+            return []
+        }
+        // exit 0: 결과 있음, 1: 매칭 없음 (시스템 전체 스캔이라 보통 0)
+        guard output.exitCode == 0 || output.exitCode == 1 else {
+            return []
+        }
+        return parseLsofListening(output.stdout)
+    }
+
+    // -F pcn 출력 (한 프로세스 단위로 묶인 레코드들):
+    //   p47291    ← PID
+    //   cnode     ← command name (9자로 잘림)
+    //   n*:3000   ← 주소:포트
+    //   n*:3001
+    //   p47292    ← 다음 PID
+    private nonisolated static func parseLsofListening(_ output: String) -> [BasicListening] {
+        var results: [BasicListening] = []
+        var seenPorts: Set<Int> = []
+        var currentPid: Int32?
+        var currentName: String?
+        var currentPorts: Set<Int> = []
+
+        func flush() {
+            if let pid = currentPid, let name = currentName {
+                for port in currentPorts where !seenPorts.contains(port) {
+                    results.append(BasicListening(port: port, pid: pid, processName: name))
+                    seenPorts.insert(port)
                 }
             }
+            currentPid = nil
+            currentName = nil
+            currentPorts.removeAll()
         }
-    }
 
-    private nonisolated static func queryStatus(portNumber: Int) -> PortStatus {
-        do {
-            let output = try ShellRunner.run(
-                "/usr/sbin/lsof",
-                ["-i", ":\(portNumber)", "-P", "-n", "-sTCP:LISTEN", "-F", "pcn"]
-            )
-            // lsof exit code: 0 = found, 1 = no match
-            if output.exitCode == 1 {
-                return .free
-            }
-            if output.exitCode != 0 {
-                let stderr = output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-                return .error("lsof exit \(output.exitCode): \(stderr)")
-            }
-            return parseLsofOutput(output.stdout) ?? .free
-        } catch {
-            return .error(error.localizedDescription)
-        }
-    }
-
-    // -F pcn 형식의 lsof 출력 파싱:
-    //   p18531    ← pid
-    //   cnode     ← command name
-    //   f16       ← (무시)
-    //   n*:3000   ← (무시)
-    // 첫 번째 LISTEN 프로세스 한 건만 반환.
-    private nonisolated static func parseLsofOutput(_ output: String) -> PortStatus? {
-        var pid: Int32?
-        var name: String?
         for line in output.split(separator: "\n") {
             guard let prefix = line.first else { continue }
             let value = String(line.dropFirst())
             switch prefix {
-            case "p": pid = Int32(value)
-            case "c": name = value
-            default: break
-            }
-            if let pid, let name {
-                return .occupied(PortOccupant(pid: pid, processName: name, command: nil))
+            case "p":
+                flush()
+                currentPid = Int32(value)
+            case "c":
+                currentName = value
+            case "n":
+                if let port = parsePortFromAddress(value) {
+                    currentPorts.insert(port)
+                }
+            default:
+                break
             }
         }
+        flush()
+        return results.sorted { $0.port < $1.port }
+    }
+
+    // 예시 입력:
+    //   "*:3000"          → 3000
+    //   "127.0.0.1:5432"  → 5432
+    //   "[::1]:8080"      → 8080
+    private nonisolated static func parsePortFromAddress(_ address: String) -> Int? {
+        guard let lastColon = address.lastIndex(of: ":") else { return nil }
+        let portStr = String(address[address.index(after: lastColon)...])
+        return Int(portStr)
+    }
+
+    // MARK: - 2차: ps + lsof cwd로 상세 정보 채움
+
+    private nonisolated static func enrich(_ basics: [BasicListening]) -> [ListeningProcess] {
+        let pids = Set(basics.map { $0.pid })
+        guard !pids.isEmpty else { return [] }
+
+        let psInfo = fetchPsInfo(pids: pids)
+        let cwdInfo = fetchCwdInfo(pids: pids)
+
+        return basics.map { basic in
+            let ps = psInfo[basic.pid]
+            let cwd = cwdInfo[basic.pid]
+            return ListeningProcess(
+                port: basic.port,
+                pid: basic.pid,
+                processName: basic.processName,
+                command: ps?.command,
+                workingDirectory: cwd,
+                elapsedTime: ps.flatMap { humanizeEtime($0.etime) },
+                projectName: detectProjectName(workingDirectory: cwd),
+                frameworkName: detectFramework(processName: basic.processName, command: ps?.command)
+            )
+        }
+    }
+
+    // MARK: - 프로젝트명 / 프레임워크 추론
+
+    /// cwd가 있으면 `package.json`의 "name" 필드를 우선 시도, 없으면 cwd의 마지막 폴더명 폴백.
+    private nonisolated static func detectProjectName(workingDirectory: String?) -> String? {
+        guard let cwd = workingDirectory, !cwd.isEmpty else { return nil }
+
+        // package.json 시도 (Node 프로젝트)
+        let packageJsonURL = URL(fileURLWithPath: cwd).appendingPathComponent("package.json")
+        if let data = try? Data(contentsOf: packageJsonURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let name = json["name"] as? String,
+           !name.isEmpty {
+            return name
+        }
+
+        // 폴더명 폴백 ("/" 같은 비정상 케이스 제외)
+        let basename = URL(fileURLWithPath: cwd).lastPathComponent
+        guard !basename.isEmpty, basename != "/" else { return nil }
+        return basename
+    }
+
+    /// 명령어 문자열을 보고 알려진 프레임워크/도구 이름 추출.
+    /// 매칭 순서:
+    ///   1. 프로세스명 자체로 식별되는 경우 (nginx, mongod 등)
+    ///   2. 명령어 substring 매칭 (next dev, vite, rails server 등)
+    private nonisolated static func detectFramework(processName: String, command: String?) -> String? {
+        let proc = processName.lowercased()
+
+        // 프로세스명만으로 식별되는 케이스
+        let processOnly: [(String, String)] = [
+            ("nginx", "Nginx"),
+            ("httpd", "Apache"),
+            ("apache", "Apache"),
+            ("caddy", "Caddy"),
+            ("mongod", "MongoDB"),
+            ("redis-server", "Redis"),
+            ("postgres", "PostgreSQL"),
+            ("mysqld", "MySQL"),
+            ("elasticsearch", "Elasticsearch"),
+            ("php-fpm", "PHP-FPM"),
+        ]
+        for (needle, name) in processOnly where proc.contains(needle) {
+            return name
+        }
+
+        // 명령어 기반 추론
+        guard let cmd = command?.lowercased(), !cmd.isEmpty else { return nil }
+
+        let cmdPatterns: [(String, String)] = [
+            // JS/TS
+            ("next dev", "Next.js"),
+            ("next start", "Next.js"),
+            ("next-dev", "Next.js"),
+            ("vite", "Vite"),
+            ("nuxt dev", "Nuxt"),
+            ("nuxt start", "Nuxt"),
+            ("webpack-dev-server", "Webpack"),
+            ("webpack serve", "Webpack"),
+            ("gatsby develop", "Gatsby"),
+            ("remix dev", "Remix"),
+            ("astro dev", "Astro"),
+            ("parcel", "Parcel"),
+            ("nest start", "NestJS"),
+            ("expo start", "Expo"),
+            ("metro", "Metro"),
+            ("nodemon", "Nodemon"),
+            ("ts-node", "ts-node"),
+            ("tsx ", "tsx"),
+            // Python
+            ("manage.py runserver", "Django"),
+            ("flask run", "Flask"),
+            ("uvicorn", "Uvicorn"),
+            ("gunicorn", "Gunicorn"),
+            ("python -m http.server", "Python HTTP"),
+            ("python3 -m http.server", "Python HTTP"),
+            // Ruby
+            ("rails server", "Rails"),
+            ("rails s ", "Rails"),
+            ("puma", "Puma"),
+            ("rackup", "Rack"),
+            // JVM
+            ("spring-boot", "Spring Boot"),
+            ("gradle ", "Gradle"),
+            ("mvn ", "Maven"),
+            // PHP
+            ("php -s", "PHP"),
+            // Go / Rust / .NET / Elixir
+            ("air ", "Air (Go)"),
+            ("cargo run", "Rust"),
+            ("dotnet run", ".NET"),
+            ("mix phx.server", "Phoenix"),
+        ]
+        for (needle, name) in cmdPatterns where cmd.contains(needle) {
+            return name
+        }
+
         return nil
+    }
+
+    /// `ps -p <pids> -o pid=,etime=,command=` 한 번에 호출.
+    /// 출력 한 줄당:
+    ///   "47291  03:12:45 /usr/local/bin/node next dev"
+    /// → (pid, etime, command) 분리.
+    private nonisolated static func fetchPsInfo(pids: Set<Int32>) -> [Int32: (command: String, etime: String)] {
+        let pidArg = pids.map(String.init).joined(separator: ",")
+        guard let output = try? ShellRunner.run(
+            "/bin/ps",
+            ["-p", pidArg, "-o", "pid=,etime=,command="]
+        ), output.exitCode == 0 else {
+            return [:]
+        }
+
+        var result: [Int32: (command: String, etime: String)] = [:]
+        for line in output.stdout.split(separator: "\n") {
+            let trimmed = String(line).trimmingCharacters(in: .whitespaces)
+            let parts = trimmed.split(maxSplits: 2, omittingEmptySubsequences: true) { $0.isWhitespace }
+            guard parts.count == 3, let pid = Int32(parts[0]) else { continue }
+            result[pid] = (command: String(parts[2]), etime: String(parts[1]))
+        }
+        return result
+    }
+
+    /// `lsof -p <pids> -a -d cwd -F pn`로 각 PID의 cwd 한 번에 조회.
+    private nonisolated static func fetchCwdInfo(pids: Set<Int32>) -> [Int32: String] {
+        let pidArg = pids.map(String.init).joined(separator: ",")
+        guard let output = try? ShellRunner.run(
+            "/usr/sbin/lsof",
+            ["-p", pidArg, "-a", "-d", "cwd", "-F", "pn"]
+        ), output.exitCode == 0 || output.exitCode == 1 else {
+            return [:]
+        }
+
+        var result: [Int32: String] = [:]
+        var currentPid: Int32?
+        for line in output.stdout.split(separator: "\n") {
+            guard let prefix = line.first else { continue }
+            let value = String(line.dropFirst())
+            switch prefix {
+            case "p":
+                currentPid = Int32(value)
+            case "n":
+                if let pid = currentPid {
+                    result[pid] = value
+                }
+            default:
+                break
+            }
+        }
+        return result
+    }
+
+    /// BSD ps etime 형식: `[[DD-]HH:]MM:SS`.
+    /// 예시 변환:
+    ///   "30:45"      → "30분 45초"
+    ///   "1:23:45"    → "1시간 23분"
+    ///   "2-03:45:12" → "2일 3시간"
+    private nonisolated static func humanizeEtime(_ etime: String) -> String {
+        let dayParts = etime.split(separator: "-", maxSplits: 1)
+        let days: Int
+        let timePart: Substring
+        if dayParts.count == 2 {
+            days = Int(dayParts[0]) ?? 0
+            timePart = dayParts[1]
+        } else {
+            days = 0
+            timePart = Substring(etime)
+        }
+
+        let timeParts = timePart.split(separator: ":").compactMap { Int($0) }
+        let hours: Int
+        let minutes: Int
+        let seconds: Int
+        switch timeParts.count {
+        case 3:
+            hours = timeParts[0]
+            minutes = timeParts[1]
+            seconds = timeParts[2]
+        case 2:
+            hours = 0
+            minutes = timeParts[0]
+            seconds = timeParts[1]
+        default:
+            return etime
+        }
+
+        if days > 0 {
+            return "\(days)일 \(hours)시간"
+        }
+        if hours > 0 {
+            return "\(hours)시간 \(minutes)분"
+        }
+        if minutes > 0 {
+            return "\(minutes)분 \(seconds)초"
+        }
+        return "\(seconds)초"
+    }
+
+    // MARK: - 필터 (전략 B: 프로세스 이름 화이트리스트)
+
+    /// 기본 dev 프레임워크/서버 이름 패턴.
+    /// 소문자 substring 매칭이라 "node", "python3" 등에 모두 잡힘.
+    private nonisolated static let defaultProcessPatterns: [String] = [
+        // JS/TS 런타임
+        "node", "deno", "bun", "npm", "pnpm", "yarn",
+        // Ruby
+        "ruby", "rails", "puma", "rake", "thin",
+        // Python
+        "python", "uvicorn", "gunicorn", "flask", "django",
+        // JVM
+        "java", "kotlin", "spring", "gradle", "maven", "tomcat",
+        // PHP
+        "php", "php-fpm",
+        // Dart/Flutter
+        "dart", "flutter",
+        // 웹 서버
+        "nginx", "apache", "httpd", "caddy",
+        // 번들러/dev server
+        "vite", "webpack", "next", "nuxt", "esbuild", "rspack",
+        // DB / 캐시
+        "mongod", "redis-server", "mysqld", "postgres", "elasticsearch",
+        // 테스트 러너
+        "rspec", "jest", "vitest",
+    ]
+
+    private nonisolated static func isVisible(
+        _ port: BasicListening,
+        extraPatterns: [String],
+        extraPorts: Set<Int>
+    ) -> Bool {
+        // 사용자가 명시한 포트는 무조건 노출
+        if extraPorts.contains(port.port) { return true }
+
+        // 시스템 예약 포트 (< 1024)는 기본 제외
+        guard port.port >= 1024 else { return false }
+
+        let name = port.processName.lowercased()
+        let allPatterns = defaultProcessPatterns + extraPatterns.map { $0.lowercased() }
+        return allPatterns.contains { !$0.isEmpty && name.contains($0) }
     }
 }
