@@ -41,7 +41,7 @@ SIGTERM(`kill -15`)을 먼저 보내고, 2초 안에 정상 종료 안 되면 SI
 
 ## 시스템 요구사항
 
-- **macOS 13.0 (Ventura)** 이상 (`MenuBarExtra` API 필요)
+- **macOS 14.0 (Sonoma)** 이상 (`@Observable` / `@Bindable` / `openSettings` 환경 키 사용)
 - 빌드용: **Xcode 15+**, Swift 5.9+
 
 > `lsof`, `ps`, `kill` 같은 시스템 기본 도구만 사용함. 외부 의존성 없음.
