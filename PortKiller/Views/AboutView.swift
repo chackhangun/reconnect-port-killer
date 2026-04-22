@@ -31,10 +31,10 @@ struct AboutView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
-                Link(destination: URL(string: "https://github.com/reconnectkr/reconnect-port-killer")!) {
+                Link(destination: URL(string: "https://github.com/chackhangun/reconnect-port-killer")!) {
                     HStack(spacing: 4) {
                         Image(systemName: "arrow.up.right.square")
-                        Text("github.com/reconnectkr/reconnect-port-killer")
+                        Text("github.com/chackhangun/reconnect-port-killer")
                     }
                     .font(.footnote)
                 }

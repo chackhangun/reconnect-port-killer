@@ -53,7 +53,7 @@ SIGTERM(`kill -15`)을 먼저 보내고, 2초 안에 정상 종료 안 되면 SI
 ### 1. 빌드
 
 ```bash
-git clone git@github.com:reconnectkr/reconnect-port-killer.git
+git clone https://github.com/chackhangun/reconnect-port-killer.git
 cd reconnect-port-killer
 open PortKiller.xcodeproj
 ```
