@@ -2,13 +2,13 @@ import SwiftUI
 
 struct MenuBarContentView: View {
     let preferences: UserPreferences
-    @State private var monitor: PortMonitor
+    let monitor: PortMonitor
     @State private var expandedPort: Int?
     @Environment(\.openSettings) private var openSettings
 
-    init(preferences: UserPreferences) {
+    init(preferences: UserPreferences, monitor: PortMonitor) {
         self.preferences = preferences
-        _monitor = State(initialValue: PortMonitor(preferences: preferences))
+        self.monitor = monitor
     }
 
     var body: some View {
@@ -234,5 +234,6 @@ private struct PortRowView: View {
 }
 
 #Preview {
-    MenuBarContentView(preferences: UserPreferences())
+    let prefs = UserPreferences()
+    return MenuBarContentView(preferences: prefs, monitor: PortMonitor(preferences: prefs))
 }
