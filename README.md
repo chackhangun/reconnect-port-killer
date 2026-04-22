@@ -84,6 +84,22 @@ open /Applications/PortKiller.app
 
 > 처음 실행 시 macOS Gatekeeper가 경고할 수 있음. **시스템 설정 → 개인정보 보호 및 보안 → "그래도 열기"**.
 
+### 3. DMG로 배포 (옵션)
+
+다른 사람에게 전달하거나 GitHub Releases에 올릴 때.
+
+**의존성**: `brew install create-dmg`
+
+```bash
+./scripts/build-dmg.sh
+```
+
+생성 위치: `build/PortKiller.dmg` (~360KB).
+
+DMG 더블클릭 → 마운트 → 좌측 PortKiller.app을 우측 Applications로 드래그하면 설치 완료. 배경 이미지는 `scripts/make-dmg-background.swift`가 자동 생성함 (그라디언트 + 화살표 + 안내 텍스트).
+
+⚠️ **코드 서명 한계**: 자체 서명("Sign to Run Locally")이라 받은 사람 Mac에서 Gatekeeper가 막음. 받은 사람이 우클릭 → 열기 또는 시스템 설정 → 개인정보 보호 및 보안 → "그래도 열기" 필요. 정식 배포는 Apple Developer Program 가입 후 codesign + notarize 필요.
+
 ---
 
 ## 사용법
@@ -167,14 +183,19 @@ reconnect-port-killer/
 │   ├── Services/
 │   │   ├── ShellRunner.swift         # Process 래퍼
 │   │   ├── PortMonitor.swift         # lsof 폴링 + 필터 + 상세 정보 enrich
-│   │   └── ProcessKiller.swift       # SIGTERM → SIGKILL 종료 로직
+│   │   ├── ProcessKiller.swift       # SIGTERM → SIGKILL 종료 로직
+│   │   └── NotificationService.swift # Kill 실패 알림 (UserNotifications)
 │   ├── Stores/
 │   │   └── UserPreferences.swift     # UserDefaults 영속화
 │   ├── Views/
-│   │   └── SettingsView.swift        # 설정 창
+│   │   ├── SettingsView.swift        # 설정 창
+│   │   └── AboutView.swift           # About 창
 │   └── Assets.xcassets/              # AppIcon, MenuBarIcon (template), AppLogo (color)
 ├── PortKillerTests/
 ├── PortKillerUITests/
+├── scripts/
+│   ├── build-dmg.sh                  # 드래그-앤-드롭 DMG 빌드
+│   └── make-dmg-background.swift     # DMG 배경 이미지 생성
 ├── PLAN.md                           # 초기 기획 문서
 └── README.md
 ```
