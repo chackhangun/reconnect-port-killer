@@ -21,22 +21,11 @@ final class PortMonitor {
         killing[port.port] != nil
     }
 
+    let preferences: UserPreferences
     private var pollingTask: Task<Void, Never>?
-    private let pollingInterval: TimeInterval
 
-    /// 추가 process 이름 패턴. 기본 화이트리스트에 더해서 매칭.
-    var extraProcessPatterns: [String]
-    /// 추가 포트 번호. 화이트리스트와 무관하게 항상 노출.
-    var extraPortNumbers: Set<Int>
-
-    init(
-        pollingInterval: TimeInterval = 5.0,
-        extraProcessPatterns: [String] = [],
-        extraPortNumbers: [Int] = []
-    ) {
-        self.pollingInterval = pollingInterval
-        self.extraProcessPatterns = extraProcessPatterns
-        self.extraPortNumbers = Set(extraPortNumbers)
+    init(preferences: UserPreferences) {
+        self.preferences = preferences
     }
 
     func start() {
@@ -45,7 +34,7 @@ final class PortMonitor {
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.performScan()
-                try? await Task.sleep(for: .seconds(self.pollingInterval))
+                try? await Task.sleep(for: .seconds(self.preferences.pollingInterval))
             }
         }
     }
@@ -69,8 +58,8 @@ final class PortMonitor {
     }
 
     private func performScan() async {
-        let extras = extraProcessPatterns
-        let extraPorts = extraPortNumbers
+        let extras = preferences.extraProcessPatterns
+        let extraPorts = Set(preferences.extraPortNumbers)
         let scanned = await Task.detached(priority: .userInitiated) {
             let basics = Self.scanListeningBasics()
             let visible = basics.filter {

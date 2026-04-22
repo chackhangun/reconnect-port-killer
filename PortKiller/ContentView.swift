@@ -1,8 +1,15 @@
 import SwiftUI
 
 struct MenuBarContentView: View {
-    @State private var monitor = PortMonitor()
+    let preferences: UserPreferences
+    @State private var monitor: PortMonitor
     @State private var expandedPort: Int?
+    @Environment(\.openSettings) private var openSettings
+
+    init(preferences: UserPreferences) {
+        self.preferences = preferences
+        _monitor = State(initialValue: PortMonitor(preferences: preferences))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -19,6 +26,9 @@ struct MenuBarContentView: View {
         .frame(width: 380)
         .onAppear { monitor.start() }
         .onDisappear { monitor.stop() }
+        // 사용자가 Settings에서 패턴/포트를 바꾸면 다음 5초를 기다리지 말고 즉시 재스캔.
+        .onChange(of: preferences.extraProcessPatterns) { _, _ in monitor.refresh() }
+        .onChange(of: preferences.extraPortNumbers) { _, _ in monitor.refresh() }
     }
 
     private var header: some View {
@@ -86,13 +96,16 @@ struct MenuBarContentView: View {
     private var footer: some View {
         HStack(spacing: 16) {
             Button {
-                // Phase 4b: Settings 창
+                openSettings()
+                // 메뉴바 앱은 LSUIElement=YES 라서 자동으로 앞에 안 옴.
+                // Settings 창이 다른 앱 뒤에 가려지지 않도록 명시적으로 활성화.
+                NSApp.activate(ignoringOtherApps: true)
             } label: {
                 Label("Settings…", systemImage: "gear")
                     .labelStyle(.titleAndIcon)
             }
             .buttonStyle(.plain)
-            .disabled(true)
+            .keyboardShortcut(",")
 
             Spacer()
 
@@ -221,5 +234,5 @@ private struct PortRowView: View {
 }
 
 #Preview {
-    MenuBarContentView()
+    MenuBarContentView(preferences: UserPreferences())
 }
