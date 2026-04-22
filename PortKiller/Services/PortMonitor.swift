@@ -35,17 +35,38 @@ final class PortMonitor {
 
     func refresh() {
         for port in ports {
-            check(port)
+            check(port, showChecking: false)
         }
     }
 
-    private func check(_ port: Port) {
-        statuses[port.number] = .checking
+    @discardableResult
+    func kill(_ port: Port) async -> ProcessKiller.Result? {
+        guard case .occupied(let occupant) = statuses[port.number] else {
+            return nil
+        }
+        // 종료가 확정되기 전까지는 원래 점유자 정보를 유지한 채 .killing 표시.
+        // 이렇게 해야 행이 즉시 사라지지 않고, 사용자가 진행 상황을 볼 수 있음.
+        statuses[port.number] = .killing(occupant)
+        let result = await ProcessKiller.kill(pid: occupant.pid)
+        check(port, showChecking: false)
+        return result
+    }
+
+    // showChecking: 사용자 액션이 진행 중임을 보여줄 때만 true.
+    // 백그라운드 폴링은 false로 호출해서 깜빡임 방지.
+    private func check(_ port: Port, showChecking: Bool) {
+        if showChecking {
+            statuses[port.number] = .checking
+        }
         let portNumber = port.number
         Task.detached(priority: .userInitiated) {
-            let status = Self.queryStatus(portNumber: portNumber)
+            let newStatus = Self.queryStatus(portNumber: portNumber)
             await MainActor.run { [weak self] in
-                self?.statuses[portNumber] = status
+                guard let self else { return }
+                // 실제로 바뀐 경우에만 대입 → SwiftUI 불필요한 리렌더링 방지
+                if self.statuses[portNumber] != newStatus {
+                    self.statuses[portNumber] = newStatus
+                }
             }
         }
     }

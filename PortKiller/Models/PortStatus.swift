@@ -11,5 +11,6 @@ enum PortStatus: Equatable {
     case checking
     case free
     case occupied(PortOccupant)
+    case killing(PortOccupant)
     case error(String)
 }
